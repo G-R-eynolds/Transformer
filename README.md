@@ -574,7 +574,7 @@ Epoch 9 Loss: 0.017904086781564542
 Epoch 10 Loss: 0.008983496685775229
 ```
 
-As you can see, even after just 10 epochs in a v small model (this only took about 5 minutes to train locally) it is already achieving very low loss, showcasing the power of the transformer architecture. Past 25 epochs there were no meaningful changes to epoch loss so I just left it at that.
+The rapid convergence is proof of the power of the transformer architecture, however, it turned out this was due to some flaws in the training methodology and some overfitting, which resulted in an essentially useless model desipte the very low loss.
 
 
 ```python
@@ -677,4 +677,116 @@ Translation:  pool pool pool pool pool pool pool pool pool pool pool pool pool p
 pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool pool
 ```
 
-Unfortunately I struggled greatly to get the model to output meaningful translations at this stage, likely due the exposure bias occuring because of use of teacher forcing in the training loop. Upscaling the model or using a larger dataset would probably also help, but these are not changes I'm interested in implementing at this time. The decreasing loss and validation loss is enough of a proof of concept for me at this point, I'd like to move on to the more interesting music generation project before investing time and resources into making it train and evaluate properly.
+At this stage the model initially just output <eos> regardless of the input prompt. I tried implementing a length penalty to encourage it to output longer strings, which led to outputs such as the one above. After some considered research I decided this might be tue to exposure bias occuring because of the use of teacher forcing during training. This is essentially a phenomenon whereby because the model is always exposed to the ground truth at every step during training, it then collapses when those truths are absent during inference. To combat this is I implemented the following changes:
+
+
+```python
+#added functionality to the training loop to feed the model increasing amounts of it's own predictions as training went on:
+for epoch in range(n_epochs):
+    epoch_loss = 0.0
+    #gradually decrease teacher forcing probability
+    teacher_forcing_ratio = max(0.3, 0.95 ** epoch)
+
+    #as before
+
+    use_teacher_forcing = (torch.rand(1).item() < teacher_forcing_ratio)
+
+    if use_teacher_forcing:
+            dec_out = net.decode(enc_out, src_mask, tgt_input, tgt_mask)
+            output = net.linear(dec_out)
+        else:
+            #mix teacher forcing and model predictions
+            seq_len = tgt_input.size(1)
+            batch_size = tgt_input.size(0)
+            outputs = torch.zeros(batch_size, seq_len, len(tgt_vocab)).to(device)
+            
+            #always start with <bos> token
+            decoder_input = tgt_input[:, 0].unsqueeze(1)
+            
+            for t in range(seq_len):
+                #create appropriate mask for current sequence length
+                _, step_mask = create_masks(src, decoder_input)
+                
+                #get decoder output for current step
+                step_output = net.decode(enc_out, src_mask, decoder_input, step_mask)
+                pred = net.linear(step_output)
+                
+                #store prediction for loss calculation
+                if t < seq_len:
+                    outputs[:, t:t+1] = pred[:, -1:, :]
+                
+                #get next token (either from ground truth or prediction)
+                if t < seq_len - 1:
+                    # mix ground truth and predicted tokens for next timestep
+                    use_ground_truth = (torch.rand(batch_size, 1).to(device) < teacher_forcing_ratio)
+                    
+                    #get predicted token
+                    next_token = pred[:, -1].argmax(dim=-1).unsqueeze(1)
+                    true_token = tgt_input[:, t+1].unsqueeze(1)
+                    mixed_token = torch.where(use_ground_truth, true_token, next_token)  #where use_ground_truth is true, use true_token, else use next_token
+                    
+                    decoder_input = torch.cat([decoder_input, mixed_token], dim=1)
+            
+            output = outputs
+#last bit as above
+```
+
+
+```python
+#added label smoothing in the training loop to try and prevent overfitting
+criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+```
+
+
+```python
+#during inference, added a temperature variable to try and increase variability of the beams produced
+temperature = 1.2
+
+ log_probs = torch.log_softmax(token_logits / temperature, dim=-1).squeeze(0)
+```
+
+The result of this tweaking was increased training times (due to the fact that when not using teacher forcing, the model processes token-by-token sequentially rather than in parallel), and much higher loss: 
+
+
+```python
+Epoch 1 Loss: 2.829222243702267 Teacher forcing: 1.00
+Epoch 2 Loss: 1.77390589708793 Teacher forcing: 0.95
+Epoch 3 Loss: 1.6888313067393108 Teacher forcing: 0.90
+Epoch 4 Loss: 1.6705951677530577 Teacher forcing: 0.86
+Epoch 5 Loss: 1.7488125560039196 Teacher forcing: 0.81
+Epoch 6 Loss: 1.6804233560751396 Teacher forcing: 0.77
+Epoch 7 Loss: 1.7289672420989586 Teacher forcing: 0.74
+Epoch 8 Loss: 1.7149874652759505 Teacher forcing: 0.70
+Epoch 9 Loss: 1.7352698361860484 Teacher forcing: 0.66
+Epoch 10 Loss: 1.7673742050898509 Teacher forcing: 0.63
+```
+
+However, when running inference I was able to get outputs (although not perfect):
+
+
+```python
+Input:  Ein junges Mädchen sitzt auf einer Bank und hält ein rotes Eis am Stiel.
+Translation:  A young girl is sitting on a bench and holding a red ice cream .  
+
+Input:  Die Katze schläft auf dem Sofa
+Translation:  The cat cat is on the couch .
+
+Input:  Ich habe gestern einen interessanten Film gesehen
+Translation:  I I I to be with some sort . . .
+
+Input:  Der Klimawandel ist eine der größten Herausforderungen unserer Zeit
+Translation:  The pitcher is a a the the the . . .
+
+Input:  Ich freue mich darauf, dich bald wiederzusehen
+Translation:  I on the track , , and the . . .
+```
+
+Compared to the google translate outputs of the same sentences:
+- A young girl sits on a bench and holds a red popsicle.
+- The cat sleeps on the sofa
+- I saw an interesting film yesterday
+- Climate change is one of the greatest challenges of our time
+- I look forward to seeing you again soon
+
+We see that when given sentences similar to those contained in the Multi30k dataset (descriptions of images, scenarios) it provides somewhat meaningful, or even very accurate, translations. However, when giving more complex or idiomatic speech, it struggles greatly.
+This is likely due simply to the limited scope of the dataset (30,000 sentences is really very small), and the model size (I had to keep it limited so I could train it locally at a reasonable speed). Both of these could be upscaled, however as this project is more of a proof of concept to check that my architecture works correctly, I'm happy to leave it with these results.

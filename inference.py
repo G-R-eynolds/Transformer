@@ -12,7 +12,8 @@ n_layers = 6
 n_heads = 8
 dropout = 0.1
 hidden_size = 2048
-alpha = 0.4
+alpha = 0.7
+temperature = 1.2
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -89,7 +90,7 @@ def translate_sentence(sentence, model, src_vocab, tgt_vocab, max_len=100, beam_
             
             #consider only the last time step
             token_logits = output[:, -1, :]  # [1, vocab_size]
-            log_probs = torch.log_softmax(token_logits, dim=-1).squeeze(0)  # [vocab_size]
+            log_probs = torch.log_softmax(token_logits / temperature, dim=-1).squeeze(0)  # [vocab_size]
             
             #get top beam_size token probabilities for current beam
             topk_log_probs, topk_indices = torch.topk(log_probs, beam_size)
@@ -120,7 +121,7 @@ def translate_sentence(sentence, model, src_vocab, tgt_vocab, max_len=100, beam_
 
 
 if __name__ == "__main__":
-    input_sentence = "Ein junges Mädchen sitzt auf einer Bank und hält ein rotes Eis am Stiel."  #change this to any German sentence
+    input_sentence = "es ist uberhaupt nicht schwierig, deutsche Sätze ins Englische zu übersetzen"  #change this to any German sentence
     translation = translate_sentence(input_sentence, model, src_vocab, tgt_vocab)
     print("Input: ", input_sentence)
     print("Translation: ", translation)

@@ -98,7 +98,7 @@ net = build_transformer(len(src_vocab), len(tgt_vocab), max_src_len, max_tgt_len
 net = net.to(device)
 
 optimizer = optim.Adam(net.parameters(), lr)
-criterion = nn.CrossEntropyLoss()
+criterion = nn.CrossEntropyLoss(label_smoothing=0.1) #added label smoothing to prevent overfitting
 
 def evaluate(model, dataloader):
     model.eval()
@@ -108,36 +108,81 @@ def evaluate(model, dataloader):
             src, tgt = batch
             src = src.to(device)
             tgt = tgt.to(device)
-            tgt_input = tgt[:, :-1]  # remove <eos>
-            tgt_target = tgt[:, 1:]  # remove <bos>
+            tgt_input = tgt[:, :-1]  #remove <eos>
+            tgt_target = tgt[:, 1:]  #remove <bos>
             src_mask, tgt_mask = create_masks(src, tgt_input)
             enc_out = model.encode(src, src_mask)
             dec_out = model.decode(enc_out, src_mask, tgt_input, tgt_mask)
             output = model.linear(dec_out)
             loss = criterion(output.reshape(-1, output.size(-1)), tgt_target.reshape(-1))
             total_loss += loss.item()
-    model.train()  # Set back to training mode
+    model.train()  #set back to training mode
     return total_loss / len(dataloader)
 
-for epoch in range (n_epochs):
+for epoch in range(n_epochs):
     epoch_loss = 0.0
+    #gradually decrease teacher forcing probability
+    teacher_forcing_ratio = max(0.3, 0.95 ** epoch)
+    
     for batch in train_dataloader:
         src, tgt = batch
-        src = src.to(device)  #transformer expects shape (seq_len, batch_size)
+        src = src.to(device)
         tgt = tgt.to(device)
-        tgt_input = tgt[:, :-1]  #remove <eos> token
-        tgt_target = tgt[:, 1:]  #remove <bos> token
+        tgt_input = tgt[:, :-1]  #remove <eos>
+        tgt_target = tgt[:, 1:]  #remove <bos>
+
         src_mask, tgt_mask = create_masks(src, tgt_input)
+        
         optimizer.zero_grad()
         enc_out = net.encode(src, src_mask)
-        dec_out = net.decode(enc_out, src_mask,tgt_input, tgt_mask)
-        output = net.linear(dec_out)
-        loss = criterion(output.reshape(-1, output.size(-1)), tgt_target.reshape(-1))  #reshape to 2D tensor
+        
+        #decide whether to use scheduled sampling for this batch
+        use_teacher_forcing = (torch.rand(1).item() < teacher_forcing_ratio)
+        
+        if use_teacher_forcing:
+            dec_out = net.decode(enc_out, src_mask, tgt_input, tgt_mask)
+            output = net.linear(dec_out)
+        else:
+            #mix teacher forcing and model predictions
+            seq_len = tgt_input.size(1)
+            batch_size = tgt_input.size(0)
+            outputs = torch.zeros(batch_size, seq_len, len(tgt_vocab)).to(device)
+            
+            #always start with <bos> token
+            decoder_input = tgt_input[:, 0].unsqueeze(1)
+            
+            for t in range(seq_len):
+                #create appropriate mask for current sequence length
+                _, step_mask = create_masks(src, decoder_input)
+                
+                #get decoder output for current step
+                step_output = net.decode(enc_out, src_mask, decoder_input, step_mask)
+                pred = net.linear(step_output)
+                
+                #store prediction for loss calculation
+                if t < seq_len:
+                    outputs[:, t:t+1] = pred[:, -1:, :]
+                
+                #get next token (either from ground truth or prediction)
+                if t < seq_len - 1:
+                    # mix ground truth and predicted tokens for next timestep
+                    use_ground_truth = (torch.rand(batch_size, 1).to(device) < teacher_forcing_ratio)
+                    
+                    #get predicted token
+                    next_token = pred[:, -1].argmax(dim=-1).unsqueeze(1)
+                    true_token = tgt_input[:, t+1].unsqueeze(1)
+                    mixed_token = torch.where(use_ground_truth, true_token, next_token)  #where use_ground_truth is true, use true_token, else use next_token
+                    
+                    decoder_input = torch.cat([decoder_input, mixed_token], dim=1)
+            
+            output = outputs
+            
+        loss = criterion(output.reshape(-1, output.size(-1)), tgt_target.reshape(-1))
         loss.backward()
         optimizer.step()
         epoch_loss += loss.item()
-    valid_loss = evaluate(net, train_dataloader)
-    print(f"Epoch {epoch+1} Loss: {epoch_loss/len(train_dataloader)} Validation Loss: {valid_loss}")
+        
+    print(f"Epoch {epoch+1} Loss: {epoch_loss/len(train_dataloader)} Teacher forcing: {teacher_forcing_ratio:.2f}")
 
 torch.save(net.state_dict(), 'transformer_weights.pth') #save the weights for inference
 torch.save(src_vocab, 'src_vocab.pth')
